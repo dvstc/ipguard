@@ -84,11 +84,13 @@ github.com/dvstc/ipguard/
 ├── go.mod
 ├── config.go          # Config, GeoMode enum, Reason constants
 ├── guard.go           # Guard struct, New(), IsBlocked, RecordFailure, Start, Close
+├── errorlog.go        # WrapErrorLog, TLS handshake error interception
 ├── handler.go         # WrapHandler, HandlerOption, IP extraction, statusRecorder
 ├── hooks.go           # Hooks struct, BlockEvent, BanEvent, UnbanEvent
 ├── listener.go        # WrapListener, guardedListener
 ├── proxyproto.go      # WrapListenerProxyProto, PROXY protocol v1/v2 parser, proxyConn
 ├── snapshot.go        # Snapshot, BanRecord, Stats
+├── errorlog_test.go
 ├── guard_test.go
 ├── handler_test.go
 ├── proxyproto_test.go
@@ -202,6 +204,7 @@ func (g *Guard) Unban(ip string) bool
 func (g *Guard) PermaBan(ip string) bool
 func (g *Guard) WrapListener(ln net.Listener, transport string) net.Listener
 func (g *Guard) WrapHandler(h http.Handler, opts ...HandlerOption) (http.Handler, error)
+func (g *Guard) WrapErrorLog(fallback *log.Logger) *log.Logger
 func (g *Guard) WrapListenerProxyProto(ln net.Listener, transport string, trusted []string, opts ...ProxyProtoOption) (net.Listener, error)
 func (g *Guard) Snapshot() Snapshot
 
@@ -489,6 +492,10 @@ If no rule matches, the IP is allowed.
 
 - **`WithClock`** enables deterministic testing of time-dependent behavior (ban expiry, find-time windows) without `time.Sleep`. Pass `WithClock` before `WithPermaBans` for deterministic timestamps in permanent ban records.
 
+- **`WrapErrorLog` returns `*log.Logger`** (concrete type, not an interface) because `http.Server.ErrorLog` is typed as `*log.Logger`. The method wraps a custom `io.Writer` that intercepts TLS error messages and calls `RecordFailure`, then forwards all messages to the consumer's logger.
+
+- **`WrapErrorLog` takes a `fallback *log.Logger` parameter** rather than forwarding to the guard's own logger. `http.Server.ErrorLog` carries all server errors, not just TLS. Forwarding everything to the guard's logger (typically at INFO level) would silently downgrade non-TLS server errors that the consumer configured at ERROR level. The fallback preserves the consumer's chosen log level and destination.
+
 ---
 
 ## HTTP Middleware: IP Extraction Algorithm
@@ -506,6 +513,24 @@ If no rule matches, the IP is allowed.
 **Validation**: `WithIPHeader` without `WithTrustedProxies` returns an error at construction. This prevents silent misconfiguration where headers are trusted from any source, enabling IP spoofing.
 
 **Failure recording**: when `WithFailureCodes(401, 404)` is set, the middleware wraps `http.ResponseWriter` with a `statusRecorder` to capture the status code. If the response status matches a configured failure code, `RecordFailure` is called automatically. The `statusRecorder` defaults status to 200 (matching Go's implicit behavior), forwards `http.Hijacker`/`http.Flusher` interfaces, and is only used when failure codes are configured (zero overhead otherwise).
+
+---
+
+## TLS Error Interception
+
+`WrapErrorLog` fills the gap between `WrapListener` (TCP accept) and `WrapHandler` (HTTP request) by intercepting TLS handshake failures that Go's `http.Server` logs to `ErrorLog`. Bots and scanners constantly probe servers with bad TLS connections -- unsupported versions, missing SNI, garbage bytes -- that fail before any HTTP request is formed. Neither `WrapListener` (already accepted the connection) nor `WrapHandler` (never sees a request) can catch these.
+
+```
+TCP connect --> WrapListener (blocks known-bad IPs)
+            --> TLS handshake (failures caught by WrapErrorLog --> RecordFailure)
+            --> HTTP request --> WrapHandler (blocks + records failures on status codes)
+```
+
+**How it works**: `WrapErrorLog(fallback)` returns a `*log.Logger` for `http.Server.ErrorLog`. Go's `http.Server` writes all TLS handshake errors with a consistent format: `http: TLS handshake error from <ip>:<port>: <reason>`. The returned logger intercepts these messages, extracts the client IP, and calls `RecordFailure(ip, "https")`. Once the IP hits `MaxRetry` failures within `FindTime`, it gets auto-banned and `WrapListener` drops all future TCP connections.
+
+**Fallback parameter**: the `fallback *log.Logger` receives all messages (TLS and non-TLS) at whatever level the consumer configured. This preserves the consumer's log level for non-TLS server errors (e.g. `"http: Accept error"`). If `fallback` is nil, messages forward to the guard's own logger. If both are nil, messages are silently consumed.
+
+**Nil guard**: if the guard is nil, `WrapErrorLog` returns the fallback as-is, matching the pass-through behavior of `WrapListener` and `WrapHandler`.
 
 ---
 
@@ -527,5 +552,5 @@ If no rule matches, the IP is allowed.
 
 ## Dependencies
 
-- Standard library only: `net`, `net/netip`, `sync`, `time`, `crypto/sha256`, `compress/gzip`, `encoding/binary`, `log/slog`, `net/http`
+- Standard library only: `net`, `net/netip`, `sync`, `time`, `crypto/sha256`, `compress/gzip`, `encoding/binary`, `log`, `log/slog`, `net/http`
 - Go 1.22 minimum (for `netip` maturity and `binary.BigEndian.AppendUint32`)

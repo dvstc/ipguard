@@ -10,7 +10,7 @@ go get github.com/dvstc/ipguard
 
 ## Packages
 
-- **`ipguard`** (root) — core guard logic: `Config`, `Guard`, `IsBlocked`, `RecordFailure`, `WrapListener`, `WrapHandler`, `WrapListenerProxyProto`, `Snapshot`, hooks, functional options
+- **`ipguard`** (root) — core guard logic: `Config`, `Guard`, `IsBlocked`, `RecordFailure`, `WrapListener`, `WrapHandler`, `WrapErrorLog`, `WrapListenerProxyProto`, `Snapshot`, hooks, functional options
 - **`ipguard/tgeo`** — TGEO binary format: `Encode`/`Decode`, `Table` (fast IPv4-to-country lookup), `Compile`, `Merge`, `VerifyAndWrite`, `Meta`
 - **`ipguard/tgeo/sources`** — geolocation data fetchers: `RIR` (NRO delegation), `BGP` (CAIDA RouteViews), `DBIP` (DB-IP Lite CSV)
 
@@ -208,6 +208,31 @@ guarded, err := guard.WrapHandler(handler,
 **With auto-failure recording:**
 
 When `WithFailureCodes` is set, the middleware automatically calls `RecordFailure` when the inner handler responds with one of the configured status codes. This lets IPGuard auto-ban IPs that repeatedly trigger 401/404/etc. without any manual wiring.
+
+### TLS Error Interception
+
+`WrapErrorLog` intercepts TLS handshake failures from `http.Server.ErrorLog` and feeds them into the auto-ban pipeline. This catches scanners that probe with bad TLS connections (unsupported versions, missing SNI, garbage bytes) before any HTTP request is formed -- the gap between `WrapListener` and `WrapHandler`.
+
+**Minimal (forwards to guard's logger):**
+
+```go
+srv := &http.Server{
+    Handler:  handler,
+    ErrorLog: guard.WrapErrorLog(nil),
+}
+```
+
+**With fallback (preserves log level):**
+
+```go
+errorLog := slog.NewLogLogger(logger.Handler(), slog.LevelError)
+srv := &http.Server{
+    Handler:  handler,
+    ErrorLog: guard.WrapErrorLog(errorLog),
+}
+```
+
+The `fallback` logger receives all messages (TLS and non-TLS) at the consumer's chosen level. TLS handshake errors additionally trigger `RecordFailure`, so the same IP hitting `MaxRetry` bad handshakes within `FindTime` gets auto-banned and `WrapListener` drops all future TCP connections.
 
 ### PROXY Protocol (TCP)
 
