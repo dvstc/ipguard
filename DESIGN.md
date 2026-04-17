@@ -511,15 +511,17 @@ If no rule matches, the IP is allowed.
 
 ## PROXY Protocol Support
 
-`WrapListenerProxyProto` wraps a `net.Listener` to decode PROXY protocol v1 (text) and v2 (binary) headers from trusted load balancers, recovering the real client IP at the TCP level.
+`WrapListenerProxyProto` wraps a `net.Listener` to decode PROXY protocol v1 (text) and v2 (binary) headers from trusted load balancers, recovering the real client IP at the TCP level. This is the standard approach for non-HTTP services (SSH, SMTP, game servers, custom TCP protocols) behind L4 load balancers like HAProxy (`send-proxy` / `send-proxy-v2`), AWS NLB, F5 BIG-IP, and Azure Load Balancer.
 
 **Trust model**: at least one trusted CIDR is required. Connections from non-trusted sources pass through without PROXY header parsing. This prevents untrusted clients from injecting fake PROXY headers.
 
-**Auto-detection**: v1 headers start with `P` (0x50), v2 headers start with `\r` (0x0D). A single peek byte distinguishes them.
+**Auto-detection**: v1 headers start with `P` (0x50), v2 headers start with `\r` (0x0D). A single peek byte distinguishes them. HAProxy's `send-proxy` emits v1, `send-proxy-v2` emits v2 -- both are handled transparently.
 
 **Anti-slowloris**: a configurable read deadline (default 5s via `WithProxyProtoTimeout`) prevents trusted-source connections that never send the PROXY header from blocking `Accept()` forever.
 
 **Wrapped connection**: returned connections implement `net.Conn` with `RemoteAddr()` returning the real client IP from the PROXY header. `Read()` drains any buffered bytes from the header parser before reading from the underlying connection, preventing data loss.
+
+**Typical deployment**: HAProxy in `mode tcp` with `send-proxy-v2` on the backend server line sends a binary PROXY v2 header as the first bytes of each connection. The Go service calls `WrapListenerProxyProto` with the HAProxy frontend IP(s) as trusted CIDRs. The returned `net.Conn` transparently presents the real client IP via `RemoteAddr()`, and all ipguard filtering (blacklist, geo, auto-ban) operates on that real IP.
 
 ---
 

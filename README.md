@@ -156,7 +156,31 @@ if err != nil {
 http.ListenAndServe(":8080", guarded)
 ```
 
-**Behind a reverse proxy (nginx, HAProxy):**
+**Behind HAProxy (HTTP mode):**
+
+HAProxy in HTTP mode (`mode http`) adds `X-Forwarded-For` by default. Trust the HAProxy IP(s) and read the header:
+
+```go
+guarded, err := guard.WrapHandler(handler,
+    ipguard.WithTrustedProxies("10.0.0.1/32"),  // HAProxy frontend IP
+    ipguard.WithIPHeader("X-Forwarded-For"),
+    ipguard.WithFailureCodes(401, 404),
+)
+```
+
+Corresponding HAProxy config:
+
+```
+frontend http_front
+    bind *:80
+    option forwardfor
+    default_backend app
+
+backend app
+    server go_app 10.0.0.2:8080 check
+```
+
+**Behind nginx:**
 
 ```go
 guarded, err := guard.WrapHandler(handler,
@@ -189,10 +213,14 @@ When `WithFailureCodes` is set, the middleware automatically calls `RecordFailur
 
 `WrapListenerProxyProto` wraps a `net.Listener` to decode PROXY protocol v1/v2 headers from trusted load balancers. Use this for non-HTTP services (SSH, SMTP, game servers, etc.) behind L4 load balancers that speak PROXY protocol.
 
+**Behind HAProxy (TCP mode with PROXY protocol):**
+
+HAProxy in TCP mode (`mode tcp`) can send PROXY protocol headers to preserve the real client IP. This is the standard approach for non-HTTP services like SSH, SMTP, or game servers behind a load balancer.
+
 ```go
 ln, _ := net.Listen("tcp", ":2222")
 guarded, err := guard.WrapListenerProxyProto(ln, "ssh",
-    []string{"10.0.0.1/32"},  // trusted LB IPs
+    []string{"10.0.0.1/32"},  // HAProxy frontend IP
 )
 if err != nil {
     log.Fatal(err)
@@ -207,7 +235,20 @@ for {
 }
 ```
 
-Supports auto-detection of v1 (text) and v2 (binary) PROXY headers. Connections from non-trusted sources pass through without PROXY header parsing, using `RemoteAddr` directly for filtering.
+Corresponding HAProxy config:
+
+```
+frontend ssh_front
+    bind *:22
+    mode tcp
+    default_backend ssh_back
+
+backend ssh_back
+    mode tcp
+    server go_app 10.0.0.2:2222 send-proxy-v2 check
+```
+
+Supports auto-detection of v1 (text) and v2 (binary) PROXY headers. Use `send-proxy` in HAProxy for v1 or `send-proxy-v2` for v2. Connections from non-trusted sources pass through without PROXY header parsing, using `RemoteAddr` directly for filtering.
 
 ### Producing TGEO Data
 
