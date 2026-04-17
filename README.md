@@ -1,6 +1,6 @@
 # IPGuard
 
-IPGuard is a Go library for TCP-level IP filtering with auto-banning, whitelist/blacklist, and geographic blocking. It drops unwanted connections at the listener level before any protocol handshake, using zero non-stdlib dependencies.
+IPGuard is a Go library for IP filtering with auto-banning, whitelist/blacklist, geographic blocking, HTTP middleware with trusted proxy support, and PROXY protocol v1/v2 decoding. It filters unwanted traffic at both the TCP listener and HTTP handler levels, extracting real client IPs behind reverse proxies and load balancers, using zero non-stdlib dependencies.
 
 ## Installation
 
@@ -10,7 +10,7 @@ go get github.com/dvstc/ipguard
 
 ## Packages
 
-- **`ipguard`** (root) — core guard logic: `Config`, `Guard`, `IsBlocked`, `RecordFailure`, `WrapListener`, `Snapshot`, hooks, functional options
+- **`ipguard`** (root) — core guard logic: `Config`, `Guard`, `IsBlocked`, `RecordFailure`, `WrapListener`, `WrapHandler`, `WrapListenerProxyProto`, `Snapshot`, hooks, functional options
 - **`ipguard/tgeo`** — TGEO binary format: `Encode`/`Decode`, `Table` (fast IPv4-to-country lookup), `Compile`, `Merge`, `VerifyAndWrite`, `Meta`
 - **`ipguard/tgeo/sources`** — geolocation data fetchers: `RIR` (NRO delegation), `BGP` (CAIDA RouteViews), `DBIP` (DB-IP Lite CSV)
 
@@ -141,6 +141,73 @@ for _, ban := range snap.Bans {
 fmt.Printf("active=%d permanent=%d history=%d\n",
     snap.Stats.ActiveBans, snap.Stats.PermanentBans, snap.Stats.BanHistorySize)
 ```
+
+### HTTP Middleware
+
+`WrapHandler` wraps an `http.Handler` with IP filtering. It extracts the real client IP from reverse proxy headers with trusted proxy validation, blocks requests from banned/blacklisted IPs with 403, and optionally records failures based on HTTP response status codes.
+
+**Direct (no proxy):**
+
+```go
+guarded, err := guard.WrapHandler(handler)
+if err != nil {
+    log.Fatal(err)
+}
+http.ListenAndServe(":8080", guarded)
+```
+
+**Behind a reverse proxy (nginx, HAProxy):**
+
+```go
+guarded, err := guard.WrapHandler(handler,
+    ipguard.WithTrustedProxies("10.0.0.0/8", "172.16.0.0/12"),
+    ipguard.WithIPHeader("X-Forwarded-For"),
+)
+```
+
+**Behind Cloudflare:**
+
+```go
+guarded, err := guard.WrapHandler(handler,
+    ipguard.WithTrustedProxies(
+        "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22",
+        "103.31.4.0/22", "141.101.64.0/18", "108.162.192.0/18",
+        "190.93.240.0/20", "188.114.96.0/20", "197.234.240.0/22",
+        "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+        "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+    ),
+    ipguard.WithIPHeader("CF-Connecting-IP"),
+    ipguard.WithFailureCodes(401, 404),
+)
+```
+
+**With auto-failure recording:**
+
+When `WithFailureCodes` is set, the middleware automatically calls `RecordFailure` when the inner handler responds with one of the configured status codes. This lets IPGuard auto-ban IPs that repeatedly trigger 401/404/etc. without any manual wiring.
+
+### PROXY Protocol (TCP)
+
+`WrapListenerProxyProto` wraps a `net.Listener` to decode PROXY protocol v1/v2 headers from trusted load balancers. Use this for non-HTTP services (SSH, SMTP, game servers, etc.) behind L4 load balancers that speak PROXY protocol.
+
+```go
+ln, _ := net.Listen("tcp", ":2222")
+guarded, err := guard.WrapListenerProxyProto(ln, "ssh",
+    []string{"10.0.0.1/32"},  // trusted LB IPs
+)
+if err != nil {
+    log.Fatal(err)
+}
+for {
+    conn, err := guarded.Accept()
+    if err != nil {
+        break
+    }
+    // conn.RemoteAddr() returns the real client IP from the PROXY header
+    go handleSSH(conn)
+}
+```
+
+Supports auto-detection of v1 (text) and v2 (binary) PROXY headers. Connections from non-trusted sources pass through without PROXY header parsing, using `RemoteAddr` directly for filtering.
 
 ### Producing TGEO Data
 

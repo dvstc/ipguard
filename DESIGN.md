@@ -1,6 +1,6 @@
 # IPGuard: Design Document
 
-This document captures the design of IPGuard, a reusable Go library for TCP-level IP filtering with auto-banning, geographic blocking, and the TGEO binary format for IP geolocation. It serves as the authoritative reference for the library's architecture, API surface, and binary format specification.
+This document captures the design of IPGuard, a reusable Go library for IP filtering with auto-banning, geographic blocking, HTTP middleware with trusted proxy support, PROXY protocol v1/v2 decoding, and the TGEO binary format for IP geolocation. It serves as the authoritative reference for the library's architecture, API surface, and binary format specification.
 
 ---
 
@@ -22,14 +22,16 @@ This document captures the design of IPGuard, a reusable Go library for TCP-leve
 
 ## Purpose
 
-**IPGuard** provides TCP-level IP filtering for Go services. Any networked application receiving connections - HTTP servers, WebSocket endpoints, custom TCP protocols - can use IPGuard to:
+**IPGuard** provides IP filtering for Go services at multiple layers. Any networked application - HTTP servers, WebSocket endpoints, custom TCP protocols - can use IPGuard to:
 
 1. Whitelist trusted IPs/CIDRs (always allowed, bypasses all other checks)
 2. Blacklist known-bad IPs/CIDRs (always blocked)
 3. Auto-ban IPs that exceed a failure threshold within a sliding window
 4. Block or allow connections by country using GeoIP data
+5. Extract real client IPs behind reverse proxies via HTTP headers (X-Forwarded-For, CF-Connecting-IP, etc.)
+6. Decode PROXY protocol v1/v2 headers from load balancers to recover real client IPs at the TCP level
 
-IPGuard is not specific to any single product. It can be imported by any Go project that needs connection-level IP filtering - reverse proxies, API gateways, update services, game servers, or any system that wants to drop unwanted traffic before protocol handshake.
+IPGuard is not specific to any single product. It can be imported by any Go project that needs IP filtering - reverse proxies, API gateways, update services, game servers, or any system behind load balancers that wants to drop unwanted traffic using the real client IP.
 
 ```
                 +-------------------+
@@ -82,10 +84,14 @@ github.com/dvstc/ipguard/
 ├── go.mod
 ├── config.go          # Config, GeoMode enum, Reason constants
 ├── guard.go           # Guard struct, New(), IsBlocked, RecordFailure, Start, Close
+├── handler.go         # WrapHandler, HandlerOption, IP extraction, statusRecorder
 ├── hooks.go           # Hooks struct, BlockEvent, BanEvent, UnbanEvent
 ├── listener.go        # WrapListener, guardedListener
+├── proxyproto.go      # WrapListenerProxyProto, PROXY protocol v1/v2 parser, proxyConn
 ├── snapshot.go        # Snapshot, BanRecord, Stats
 ├── guard_test.go
+├── handler_test.go
+├── proxyproto_test.go
 ├── tgeo/
 │   ├── format.go      # Magic, constants, GeoIPData, IPv4Entry, Encode, Decode
 │   ├── meta.go        # Meta struct (canonical JSON metadata)
@@ -195,7 +201,25 @@ func (g *Guard) Reconfigure(cfg Config) error
 func (g *Guard) Unban(ip string) bool
 func (g *Guard) PermaBan(ip string) bool
 func (g *Guard) WrapListener(ln net.Listener, transport string) net.Listener
+func (g *Guard) WrapHandler(h http.Handler, opts ...HandlerOption) (http.Handler, error)
+func (g *Guard) WrapListenerProxyProto(ln net.Listener, transport string, trusted []string, opts ...ProxyProtoOption) (net.Listener, error)
 func (g *Guard) Snapshot() Snapshot
+
+// --- HTTP Middleware Options ---
+
+type HandlerOption func(*handlerConfig)
+
+func WithTrustedProxies(cidrs ...string) HandlerOption
+func WithIPHeader(header string) HandlerOption
+func WithIPExtractor(fn func(*http.Request) string) HandlerOption
+func WithFailureCodes(codes ...int) HandlerOption
+func WithTransport(transport string) HandlerOption
+
+// --- PROXY Protocol Options ---
+
+type ProxyProtoOption func(*proxyProtoConfig)
+
+func WithProxyProtoTimeout(d time.Duration) ProxyProtoOption
 
 // --- Snapshot ---
 
@@ -464,6 +488,38 @@ If no rule matches, the IP is allowed.
 - **Functional options** for construction: `WithHooks`, `WithGeo`, `WithLogger`, `WithClock`, `WithPermaBans`. This keeps the `New()` signature clean while allowing flexible configuration.
 
 - **`WithClock`** enables deterministic testing of time-dependent behavior (ban expiry, find-time windows) without `time.Sleep`. Pass `WithClock` before `WithPermaBans` for deterministic timestamps in permanent ban records.
+
+---
+
+## HTTP Middleware: IP Extraction Algorithm
+
+`WrapHandler` provides HTTP-level IP filtering with secure extraction of the real client IP behind reverse proxies. The extraction priority is:
+
+1. **Custom extractor** (`WithIPExtractor`): full consumer control, bypasses all trust logic
+2. **Header + trusted proxies** (`WithIPHeader` + `WithTrustedProxies`):
+   - Parse `RemoteAddr` to get the immediate connection IP
+   - If `RemoteAddr` is NOT a trusted proxy CIDR, ignore the header entirely and use `RemoteAddr`
+   - If trusted, read the configured header and walk comma-separated values right-to-left, skipping entries matching trusted proxy CIDRs, returning the first non-trusted entry
+   - If ALL entries are trusted (chain exhausted), fall back to `RemoteAddr`
+3. **Default**: extract IP from `RemoteAddr`
+
+**Validation**: `WithIPHeader` without `WithTrustedProxies` returns an error at construction. This prevents silent misconfiguration where headers are trusted from any source, enabling IP spoofing.
+
+**Failure recording**: when `WithFailureCodes(401, 404)` is set, the middleware wraps `http.ResponseWriter` with a `statusRecorder` to capture the status code. If the response status matches a configured failure code, `RecordFailure` is called automatically. The `statusRecorder` defaults status to 200 (matching Go's implicit behavior), forwards `http.Hijacker`/`http.Flusher` interfaces, and is only used when failure codes are configured (zero overhead otherwise).
+
+---
+
+## PROXY Protocol Support
+
+`WrapListenerProxyProto` wraps a `net.Listener` to decode PROXY protocol v1 (text) and v2 (binary) headers from trusted load balancers, recovering the real client IP at the TCP level.
+
+**Trust model**: at least one trusted CIDR is required. Connections from non-trusted sources pass through without PROXY header parsing. This prevents untrusted clients from injecting fake PROXY headers.
+
+**Auto-detection**: v1 headers start with `P` (0x50), v2 headers start with `\r` (0x0D). A single peek byte distinguishes them.
+
+**Anti-slowloris**: a configurable read deadline (default 5s via `WithProxyProtoTimeout`) prevents trusted-source connections that never send the PROXY header from blocking `Accept()` forever.
+
+**Wrapped connection**: returned connections implement `net.Conn` with `RemoteAddr()` returning the real client IP from the PROXY header. `Read()` drains any buffered bytes from the header parser before reading from the underlying connection, preventing data loss.
 
 ---
 
