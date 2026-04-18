@@ -2,6 +2,7 @@ package sources
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"net/netip"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dvstc/ipguard/tgeo"
@@ -21,6 +23,10 @@ type DBIP struct {
 	Client *http.Client
 	Logger *slog.Logger
 	URL    string // override for testing; empty = constructed from date
+	Cache  Cache  // optional; nil = auto-created MemoryCache
+
+	initCache    sync.Once
+	defaultCache Cache
 }
 
 func (d *DBIP) Name() string  { return "dbip-lite" }
@@ -67,26 +73,37 @@ func (d *DBIP) download(ctx context.Context, client *http.Client) ([]byte, error
 }
 
 func (d *DBIP) downloadGzip(ctx context.Context, client *http.Client, url string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	c := d.cache()
+	logger := d.logger()
+
+	resp, body, err := httpDoConditional(ctx, client, url, c, logger)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, url)
+	if resp == nil {
+		return body, nil
 	}
 
-	gr, err := gzip.NewReader(resp.Body)
+	gr, err := gzip.NewReader(bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("gzip reader: %w", err)
 	}
 	defer gr.Close()
-	return readLimited(gr, maxResponseBytes)
+
+	decompressed, err := readLimited(gr, maxResponseBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	if c != nil {
+		_ = c.Put(&CacheEntry{
+			URL:          url,
+			Data:         decompressed,
+			ETag:         resp.Header.Get("ETag"),
+			LastModified: resp.Header.Get("Last-Modified"),
+		})
+	}
+	return decompressed, nil
 }
 
 func parseDBIPCSV(data []byte) ([]tgeo.IPRange, error) {
@@ -138,6 +155,14 @@ func parseDBIPCSV(data []byte) ([]tgeo.IPRange, error) {
 	}
 
 	return ranges, scanner.Err()
+}
+
+func (d *DBIP) cache() Cache {
+	if d.Cache != nil {
+		return d.Cache
+	}
+	d.initCache.Do(func() { d.defaultCache = NewMemoryCache() })
+	return d.defaultCache
 }
 
 func (d *DBIP) logger() *slog.Logger {

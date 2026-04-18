@@ -22,6 +22,13 @@ func LoadTable(path string) (*Table, error) {
 	if err != nil {
 		return nil, err
 	}
+	return LoadTableFromBytes(raw)
+}
+
+// LoadTableFromBytes parses uncompressed TGEO binary data and returns a Table
+// ready for lookups. Use this when the TGEO data is already in memory rather
+// than on disk.
+func LoadTableFromBytes(raw []byte) (*Table, error) {
 	if len(raw) < HeaderSize || !bytes.Equal(raw[:4], Magic[:]) {
 		return nil, fmt.Errorf("invalid TGEO file")
 	}
