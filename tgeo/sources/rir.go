@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/dvstc/ipguard/tgeo"
 )
@@ -32,6 +33,10 @@ type RIR struct {
 	Client *http.Client
 	Logger *slog.Logger
 	URL    string // override for testing; empty = nroURL
+	Cache  Cache  // optional; nil = auto-created MemoryCache
+
+	initCache    sync.Once
+	defaultCache Cache
 }
 
 func (r *RIR) Name() string  { return "rir-nro" }
@@ -80,7 +85,10 @@ func (r *RIR) downloadAll(ctx context.Context) ([][]byte, error) {
 		url = nroURL
 	}
 
-	body, err := httpGet(ctx, client, url)
+	c := r.cache()
+	logger := r.logger()
+
+	body, err := httpGet(ctx, client, url, c, logger)
 	if err == nil {
 		return [][]byte{body}, nil
 	}
@@ -89,13 +97,13 @@ func (r *RIR) downloadAll(ctx context.Context) ([][]byte, error) {
 		return nil, err
 	}
 
-	r.logger().Warn("NRO combined file unavailable, falling back to individual RIRs", "error", err)
+	logger.Warn("NRO combined file unavailable, falling back to individual RIRs", "error", err)
 
 	var bodies [][]byte
 	for _, furl := range rirFallbackURLs {
-		b, ferr := httpGet(ctx, client, furl)
+		b, ferr := httpGet(ctx, client, furl, c, logger)
 		if ferr != nil {
-			r.logger().Warn("RIR fallback download failed", "url", furl, "error", ferr)
+			logger.Warn("RIR fallback download failed", "url", furl, "error", ferr)
 			continue
 		}
 		bodies = append(bodies, b)
@@ -104,6 +112,14 @@ func (r *RIR) downloadAll(ctx context.Context) ([][]byte, error) {
 		return nil, fmt.Errorf("all RIR downloads failed")
 	}
 	return bodies, nil
+}
+
+func (r *RIR) cache() Cache {
+	if r.Cache != nil {
+		return r.Cache
+	}
+	r.initCache.Do(func() { r.defaultCache = NewMemoryCache() })
+	return r.defaultCache
 }
 
 func (r *RIR) logger() *slog.Logger {

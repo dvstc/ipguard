@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/dvstc/ipguard/tgeo"
 )
@@ -28,6 +29,10 @@ type BGP struct {
 	ASNMap         ASNCountryMap
 	CreationLogURL string // override for testing
 	BaseURL        string // override for testing
+	Cache          Cache  // optional; nil = auto-created MemoryCache
+
+	initCache    sync.Once
+	defaultCache Cache
 }
 
 func (b *BGP) Name() string  { return "bgp-caida" }
@@ -69,7 +74,7 @@ func (b *BGP) discoverLatestFile(ctx context.Context, client *http.Client) (stri
 		logURL = caidaCreationLogURL
 	}
 
-	body, err := httpGet(ctx, client, logURL)
+	body, err := httpGet(ctx, client, logURL, b.cache(), b.logger())
 	if err != nil {
 		return "", fmt.Errorf("fetch creation log: %w", err)
 	}
@@ -107,31 +112,46 @@ func (b *BGP) discoverLatestFile(ctx context.Context, client *http.Client) (stri
 }
 
 func (b *BGP) downloadGzip(ctx context.Context, client *http.Client, url string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+	c := b.cache()
+	logger := b.logger()
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, url)
-	}
-
-	body, err := readLimited(resp.Body, maxResponseBytes)
+	resp, body, err := httpDoConditional(ctx, client, url, c, logger)
 	if err != nil {
 		return nil, err
+	}
+	if resp == nil {
+		return body, nil
 	}
 
 	gr, err := gzip.NewReader(bytes.NewReader(body))
 	if err != nil {
+		// Not gzip — treat raw body as the result.
+		if c != nil {
+			_ = c.Put(&CacheEntry{
+				URL:          url,
+				Data:         body,
+				ETag:         resp.Header.Get("ETag"),
+				LastModified: resp.Header.Get("Last-Modified"),
+			})
+		}
 		return body, nil
 	}
 	defer gr.Close()
-	return readLimited(gr, maxResponseBytes)
+
+	decompressed, err := readLimited(gr, maxResponseBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	if c != nil {
+		_ = c.Put(&CacheEntry{
+			URL:          url,
+			Data:         decompressed,
+			ETag:         resp.Header.Get("ETag"),
+			LastModified: resp.Header.Get("Last-Modified"),
+		})
+	}
+	return decompressed, nil
 }
 
 func (b *BGP) parsePfx2AS(data []byte) ([]tgeo.IPRange, error) {
@@ -207,6 +227,14 @@ func prefixLastAddr(p netip.Prefix) netip.Addr {
 	out[2] = byte(v >> 8)
 	out[3] = byte(v)
 	return netip.AddrFrom4(out)
+}
+
+func (b *BGP) cache() Cache {
+	if b.Cache != nil {
+		return b.Cache
+	}
+	b.initCache.Do(func() { b.defaultCache = NewMemoryCache() })
+	return b.defaultCache
 }
 
 func (b *BGP) logger() *slog.Logger {
