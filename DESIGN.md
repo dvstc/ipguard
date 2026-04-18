@@ -57,23 +57,32 @@ IPGuard is not specific to any single product. It can be imported by any Go proj
 
 ## Architecture
 
-The library has three packages with a clean dependency graph:
+The library has four packages with a clean dependency graph:
 
 ```mermaid
 graph TD
     subgraph lib ["github.com/dvstc/ipguard"]
         root["ipguard (root)"]
         tgeo["ipguard/tgeo"]
+        fetch["ipguard/tgeo/fetch"]
         sources["ipguard/tgeo/sources"]
     end
 
     sources -->|"imports IPRange, helpers"| tgeo
+    fetch -->|"imports Table, Decode, DecompressGzip"| tgeo
+    fetch -->|"imports Cache, HTTPGetCached"| sources
     root -.->|"GeoLookup interface satisfied by"| tgeo
 ```
 
 - `tgeo/sources` imports `tgeo` for the `IPRange` type and address helpers
+- `tgeo/fetch` imports both `tgeo` (for `Table`, `DecompressGzip`) and `tgeo/sources` (for `Cache`, `HTTPGetCached`)
 - The root `ipguard` package is fully independent of `tgeo` - it defines a `GeoLookup` interface that `tgeo.Table` happens to satisfy, but any implementation works
 - No circular dependencies, no non-stdlib imports
+
+**Two paths for geo data:**
+
+- **Path 1 (default):** `fetch.Table(ctx)` downloads a pre-compiled TGEO binary from the [ipguard-geofeed](https://github.com/dvstc/ipguard-geofeed) curation service (Cloudflare R2). One function call, automatic HTTP conditional request caching.
+- **Path 2 (custom):** Use `tgeo/sources` directly to fetch from upstream providers (RIR, CAIDA, DB-IP), then `tgeo.Merge` and `tgeo.Compile`. All source fetchers include built-in conditional request caching.
 
 ---
 
@@ -107,12 +116,17 @@ github.com/dvstc/ipguard/
 │   ├── compile_test.go
 │   ├── merge_test.go
 │   ├── verify_test.go
+│   ├── fetch/
+│   │   ├── fetch.go       # fetch.Table() — curated TGEO table loader (Path 1)
+│   │   └── fetch_test.go
 │   └── sources/
 │       ├── source.go  # Source, RIRSource interfaces, ASNCountryMap
+│       ├── cache.go   # Cache interface, CacheEntry, MemoryCache
 │       ├── rir.go     # RIR struct (NRO delegation files)
 │       ├── bgp.go     # BGP struct (CAIDA RouteViews pfx2as)
 │       ├── dbip.go    # DBIP struct (DB-IP Lite CSV)
-│       ├── http.go    # shared httpGet helper
+│       ├── http.go    # httpGet, httpDoConditional, HTTPGetCached
+│       ├── cache_test.go
 │       ├── rir_test.go
 │       ├── bgp_test.go
 │       └── dbip_test.go
@@ -300,6 +314,7 @@ type Meta struct {
 type Table struct { /* unexported fields */ }
 
 func LoadTable(path string) (*Table, error)
+func LoadTableFromBytes(raw []byte) (*Table, error)
 func (t *Table) LookupCountry(ip netip.Addr) string
 func (t *Table) EntryCount() int
 func (t *Table) CodeCount() int
@@ -348,6 +363,19 @@ func Merge(sourcesData map[string]SourceData) ([]IPRange, MergeStats)
 func VerifyAndWrite(compressed []byte, expectedChecksum string, destPath string) error
 ```
 
+### Fetch Package (`ipguard/tgeo/fetch`)
+
+```go
+func Table(ctx context.Context, opts ...Option) (*tgeo.Table, error)
+
+type Option func(*options)
+func WithURL(url string) Option
+func WithClient(c *http.Client) Option
+func WithLogger(l *slog.Logger) Option
+```
+
+The default URL points to the ipguard-geofeed Cloudflare Worker's R2 bucket. The curation service also exposes a `/meta.json` endpoint returning `tgeo.Meta`-shaped JSON, allowing consumers to check the current version, checksum, and published timestamp without downloading the full file.
+
 ### Sources Package (`ipguard/tgeo/sources`)
 
 ```go
@@ -366,12 +394,32 @@ type RIRSource interface {
 
 type ASNCountryMap map[uint32]string
 
+// --- HTTP Caching ---
+
+type CacheEntry struct {
+    URL          string
+    Data         []byte
+    ETag         string
+    LastModified string
+}
+
+type Cache interface {
+    Get(url string) (*CacheEntry, error)
+    Put(entry *CacheEntry) error
+}
+
+func NewMemoryCache() *MemoryCache
+func HTTPGetCached(ctx context.Context, client *http.Client, url string, cache Cache, logger *slog.Logger) ([]byte, error)
+
 // --- Implementations ---
+// All source structs include a Cache field that defaults to an
+// auto-created MemoryCache for courteous HTTP conditional requests.
 
 type RIR struct {
     Client *http.Client
     Logger *slog.Logger
     URL    string
+    Cache  Cache
 }
 
 type BGP struct {
@@ -380,12 +428,14 @@ type BGP struct {
     ASNMap         ASNCountryMap
     CreationLogURL string
     BaseURL        string
+    Cache          Cache
 }
 
 type DBIP struct {
     Client *http.Client
     Logger *slog.Logger
     URL    string
+    Cache  Cache
 }
 ```
 
@@ -486,7 +536,11 @@ If no rule matches, the IP is allowed.
 
 - **`tgeo.VerifyAndWrite`** owns the data integrity pipeline: checksum verification over compressed bytes, decompression, and atomic write (temp file + rename).
 
-- **`tgeo/sources`** owns the domain knowledge of fetching from public geolocation data providers (RIR delegation files, CAIDA BGP data, DB-IP Lite CSV). Any project that needs to produce TGEO data can import these implementations directly.
+- **`tgeo/sources`** owns the domain knowledge of fetching from public geolocation data providers (RIR delegation files, CAIDA BGP data, DB-IP Lite CSV). Any project that needs to produce TGEO data can import these implementations directly. All fetchers use HTTP conditional requests (`If-None-Match` / `If-Modified-Since`) by default via a lazily-initialized `MemoryCache`, so repeated calls avoid re-downloading unchanged data from free community servers.
+
+- **`tgeo/fetch`** exists as a separate package from `tgeo` to avoid an import cycle. `tgeo/sources` imports `tgeo`, so `tgeo` cannot import `tgeo/sources` for the `Cache` types. `tgeo/fetch` sits alongside both and imports from each.
+
+- **ipguard-geofeed** is a Cloudflare Worker (TypeScript) that curates the default TGEO file. It re-implements the source parsing, merge, and TGEO encoding logic in TypeScript, using KV for persistent cache metadata and R2 for both cached source data and the compiled output. A Cron Trigger every 6 hours fetches upstream sources with conditional headers, so community servers only transfer data when it has changed. The Worker also serves a `/meta.json` endpoint matching `tgeo.Meta` for lightweight version checks.
 
 - **Functional options** for construction: `WithHooks`, `WithGeo`, `WithLogger`, `WithClock`, `WithPermaBans`. This keeps the `New()` signature clean while allowing flexible configuration.
 

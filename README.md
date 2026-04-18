@@ -11,8 +11,9 @@ go get github.com/dvstc/ipguard
 ## Packages
 
 - **`ipguard`** (root) — core guard logic: `Config`, `Guard`, `IsBlocked`, `RecordFailure`, `WrapListener`, `WrapHandler`, `WrapErrorLog`, `WrapListenerProxyProto`, `Snapshot`, hooks, functional options
-- **`ipguard/tgeo`** — TGEO binary format: `Encode`/`Decode`, `Table` (fast IPv4-to-country lookup), `Compile`, `Merge`, `VerifyAndWrite`, `Meta`
-- **`ipguard/tgeo/sources`** — geolocation data fetchers: `RIR` (NRO delegation), `BGP` (CAIDA RouteViews), `DBIP` (DB-IP Lite CSV)
+- **`ipguard/tgeo`** — TGEO binary format: `Encode`/`Decode`, `Table`/`LoadTableFromBytes` (fast IPv4-to-country lookup), `Compile`, `Merge`, `VerifyAndWrite`, `Meta`
+- **`ipguard/tgeo/fetch`** — curated table loader: `fetch.Table(ctx)` downloads a pre-compiled TGEO file with HTTP conditional request caching
+- **`ipguard/tgeo/sources`** — geolocation data fetchers: `RIR` (NRO delegation), `BGP` (CAIDA RouteViews), `DBIP` (DB-IP Lite CSV), with built-in HTTP conditional request caching
 
 ## Usage
 
@@ -275,7 +276,41 @@ backend ssh_back
 
 Supports auto-detection of v1 (text) and v2 (binary) PROXY headers. Use `send-proxy` in HAProxy for v1 or `send-proxy-v2` for v2. Connections from non-trusted sources pass through without PROXY header parsing, using `RemoteAddr` directly for filtering.
 
-### Producing TGEO Data
+### Geo Data: Curated (Recommended)
+
+The simplest way to get geo blocking working. Downloads a pre-compiled TGEO table from the [ipguard-geofeed](https://github.com/dvstc/ipguard-geofeed) service (a Cloudflare Worker backed by R2). Uses HTTP conditional requests so subsequent calls only transfer data when the upstream file has changed.
+
+```go
+import "github.com/dvstc/ipguard/tgeo/fetch"
+
+table, err := fetch.Table(ctx)
+if err != nil {
+    log.Fatal(err)
+}
+guard.SetGeoLookup(table)
+```
+
+To check the current feed version without downloading, query the metadata endpoint:
+
+```
+GET https://your-r2-domain.example.com/meta.json
+
+{
+  "version": "1",
+  "published_at": "2026-04-17T12:00:00Z",
+  "checksum": "sha256:...",
+  "size": 4823041,
+  "download_url": "https://your-r2-domain.example.com/latest.tgeo.gz",
+  "sources": ["rir-nro", "bgp-caida", "dbip-lite"],
+  "license": "CC-BY-4.0"
+}
+```
+
+The response matches the `tgeo.Meta` struct.
+
+### Geo Data: Custom Sources (Advanced)
+
+For consumers who want to use their own sources, customize the pipeline, or add proprietary data. All source fetchers include HTTP conditional request caching by default (sends `If-None-Match` / `If-Modified-Since` headers to upstream servers).
 
 ```go
 import (

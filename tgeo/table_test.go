@@ -239,6 +239,46 @@ func TestLoadTable_AtomicSwapDirect(t *testing.T) {
 	}
 }
 
+func TestLoadTableFromBytes_Parity(t *testing.T) {
+	data := buildTestTGEO(t, []tgeoTestEntry{
+		{0x01000000, 0},
+		{0x02000000, 1},
+	}, []string{"US", "CN"})
+
+	tableFile, err := func() (*Table, error) {
+		dir := t.TempDir()
+		path := writeTestTGEO(t, dir, data)
+		return LoadTable(path)
+	}()
+	if err != nil {
+		t.Fatalf("LoadTable: %v", err)
+	}
+
+	tableBytes, err := LoadTableFromBytes(data)
+	if err != nil {
+		t.Fatalf("LoadTableFromBytes: %v", err)
+	}
+
+	if tableFile.EntryCount() != tableBytes.EntryCount() {
+		t.Errorf("entry count mismatch: file=%d bytes=%d", tableFile.EntryCount(), tableBytes.EntryCount())
+	}
+	if tableFile.CodeCount() != tableBytes.CodeCount() {
+		t.Errorf("code count mismatch: file=%d bytes=%d", tableFile.CodeCount(), tableBytes.CodeCount())
+	}
+
+	ip := netip.MustParseAddr("1.0.0.1")
+	if tableFile.LookupCountry(ip) != tableBytes.LookupCountry(ip) {
+		t.Errorf("lookup mismatch for %s: file=%s bytes=%s", ip, tableFile.LookupCountry(ip), tableBytes.LookupCountry(ip))
+	}
+}
+
+func TestLoadTableFromBytes_BadData(t *testing.T) {
+	_, err := LoadTableFromBytes([]byte("not tgeo data"))
+	if err == nil {
+		t.Fatal("expected error for bad data")
+	}
+}
+
 func TestLoadTable_TruncatedCodes(t *testing.T) {
 	dir := t.TempDir()
 	var buf bytes.Buffer
