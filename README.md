@@ -299,6 +299,7 @@ A feed can also publish a `meta.json` alongside the binary for lightweight versi
   "version": "1",
   "published_at": "2026-04-17T12:00:00Z",
   "checksum": "sha256:...",
+  "checksum_raw": "sha256:...",
   "size": 4823041,
   "download_url": "https://your-tgeo-feed.example.com/latest.tgeo.gz",
   "sources": ["rir-nro", "bgp-caida", "dbip-lite"],

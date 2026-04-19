@@ -7,6 +7,7 @@ type Meta struct {
 	Version     string   `json:"version"`
 	PublishedAt string   `json:"published_at"`
 	Checksum    string   `json:"checksum"`
+	ChecksumRaw string   `json:"checksum_raw"`
 	Size        int64    `json:"size"`
 	DownloadURL string   `json:"download_url"`
 	Sources     []string `json:"sources"`
